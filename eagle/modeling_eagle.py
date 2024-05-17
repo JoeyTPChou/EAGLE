@@ -1,3 +1,5 @@
+# /usr/local/lib/python3.10/dist-packages/optimum/habana/transformers/models/llama/modeling_llama.py
+#  390                 if past_key_value is None or not isinstance(past_key_value, tuple) and len(past_key_value.value_cache) == 0:
 import os
 import random
 import copy
@@ -1184,6 +1186,8 @@ def forward_with_tree_mask(
         past_key_values=None,  # [MODIFIED] past_key_value is KVCache class
         inputs_embeds: Optional[torch.FloatTensor] = None,
 ):
+    # JOEY HACK(Move this into Optimum-habana)
+    # --------------------------------------------
     output_attentions = False
     use_cache = True
     batch_size, seq_length = input_ids.shape
@@ -1198,7 +1202,7 @@ def forward_with_tree_mask(
         use_legacy_cache = not isinstance(past_key_values, Cache)
         if use_legacy_cache:
             past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-        past_key_values_length = past_key_values.get_usable_length(seq_length)
+            past_key_values_length = past_key_values.get_usable_length(seq_length)
 
     if position_ids is None:
         device = input_ids.device if input_ids is not None else inputs_embeds.device
@@ -1227,12 +1231,15 @@ def forward_with_tree_mask(
         inputs_embeds,
         past_key_values_length,
     )
+    # --------------------------------------------
 
     hidden_states = inputs_embeds
     next_decoder_cache = ()
 
     for idx, decoder_layer in enumerate(model.layers):
 
+        print(idx)
+        # try:
         layer_outputs = decoder_layer(
             hidden_states,
             attention_mask=attention_mask,
@@ -1241,6 +1248,10 @@ def forward_with_tree_mask(
             output_attentions=output_attentions,
             use_cache=use_cache,
         )
+        # except Exception as e:
+        #     print(e)
+        #     import ipdb; ipdb.set_trace(context=30)
+        #     pass
 
         hidden_states = layer_outputs[0]
 
@@ -1258,9 +1269,19 @@ def forward_with_tree_mask(
 def initialize_tree(input_ids, model, logits_processor, attention_mask=None):
     position_ids = attention_mask.long().cumsum(-1) - 1
     position_ids.masked_fill_(attention_mask == 0, 1)
-    hidden_states, past_key_value = forward_with_tree_mask(model.base_model.model, input_ids=input_ids,
-                                                           attention_mask=attention_mask, position_ids=position_ids)
-    logits=model.base_model.lm_head(hidden_states)
+    
+    # HACK(Joey): Manually call forward function without using forward_with_tree_mask
+    # -------------------------------------------------------------------------------
+    # hidden_states, past_key_value = forward_with_tree_mask(model.base_model.model, input_ids=input_ids,
+    #                                                        attention_mask=attention_mask, position_ids=position_ids)
+
+    outputs = model.base_model.model.forward(input_ids=input_ids, attention_mask=atte# ntion_mask, position_ids=position_ids,
+                                                                   lazy_mode=True)
+    hidden_states = outputs.last_hidden_state
+    past_key_value = outputs.past_key_values
+    # -------------------------------------------------------------------------------
+
+    logits = model.base_model.lm_head(hidden_states)
 
     if logits_processor is not None:
         sample_logits = logits[:, -1]
@@ -1276,8 +1297,8 @@ def initialize_tree(input_ids, model, logits_processor, attention_mask=None):
                                            attention_mask=attention_mask)
 
 
-
     return tree_logits, logits, hidden_states, token,past_key_value
+
 
 def generate_candidates(tree_logits, tree_indices, retrieve_indices, sample_token, logits_processor):
     bs = sample_token.shape[0]
@@ -1295,7 +1316,14 @@ def generate_candidates(tree_logits, tree_indices, retrieve_indices, sample_toke
     tree_candidates_ext = torch.cat(
         [tree_candidates, torch.zeros((bs, 1), dtype=torch.long, device=tree_candidates.device)-1], dim=-1)
 
-    cart_candidates = tree_candidates_ext[:, retrieve_indices]
+    # cart_candidates = tree_candidates_ext[:, retrieve_indices]
+
+    cart_candidates = []
+    for ind in retrieve_indices:
+        cart_candidates.append(tree_candidates_ext[:, ind])
+
+    cart_candidates = torch.cat(cart_candidates)
+
 
     if logits_processor is not None:
         candidates_tree_prob = tree_logits[1]
@@ -1333,12 +1361,28 @@ def tree_decoding(
     zero_num = zero_num[:, None]
     position_ids = tree_position_ids[None,:] + input_ids.shape[1]-zero_num
 
-
     attention_mask = torch.cat(
         (attention_mask, torch.ones_like(tree_candidates, device=attention_mask.device, dtype=attention_mask.dtype)), dim=1)
 
     hidden_states, past_key_value = forward_with_tree_mask(model.base_model.model, input_ids=tree_candidates,past_key_values=past_key_values,
                                                            attention_mask=attention_mask, tree_mask=tree_mask,position_ids=position_ids)
+
+    # batch_size, seq_length = input_ids.shape
+    # inputs_embeds = model.base_model.model.embed_tokens(input_ids)
+    # import ipdb; ipdb.set_trace(context=30)
+    # attention_mask = _prepare_decoder_attention_mask(
+    #     attention_mask,
+    #     tree_mask,
+    #     (batch_size, seq_length),
+    #     inputs_embeds,
+    #     past_key_values_length,
+    # )
+    # import ipdb; ipdb.set_trace(context=30)
+    # outputs = model.base_model.model.forward(input_ids=tree_candidates, past_key_values=past_key_values,
+    #                                          attention_mask=attention_mask, position_ids=position_ids,
+    #                                                                lazy_mode=True)
+    # hidden_states = outputs.last_hidden_state
+    # past_key_value = outputs.past_key_values
 
     tree_logits = model.base_model.lm_head(hidden_states)
 
@@ -1543,9 +1587,11 @@ def update_inference_inputs(
 
 
 
+    t_b = time.time()
     tree_logits = model.ea_layer.topK_genrate(draft_hidden,
                                               input_ids=draft_input_ids,
                                               head=model.base_model.lm_head, logits_processor=logits_processor,attention_mask=attention_mask,len_posi=input_ids.shape[1])
+    print(time.time() - t_b)
 
 
 
@@ -1635,6 +1681,8 @@ class EAGLE:
             top_k=0,
             max_new_tokens=512,
             max_length=2048,
+            lazy_mode: bool = True,
+            hpu_graphs: bool = True,
     ) -> torch.LongTensor:
 
         tree_choices = self.tree
